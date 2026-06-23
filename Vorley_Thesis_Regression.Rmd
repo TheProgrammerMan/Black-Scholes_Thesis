@@ -1,0 +1,592 @@
+---
+title: "WV_Thesis_Regression"
+author: "Wes Vorley"
+date: "2026-04-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidyquant)
+library(minpack.lm)
+library(slider)
+```
+
+***
+#### Read call data, remove N/A values and separate by date call was listed
+```{r}
+calls <- read.csv("SPX_ATM_calls_MayJul2024.csv") %>%
+  na.omit() %>%
+  mutate(
+    quote_date = as.Date(date), .before = expiration_date,
+    expiration_date = as.Date(expiration_date)
+  ) %>%
+  select(-date)
+```
+
+***
+#### Obtain daily log returns of SPX from May 2023 to August 2025, add column for 21-trading-day rolling volatility, and annualized using `sqrt(252)`.
+```{r}
+spx <- tq_get("^GSPC", get = "stock.prices",
+               from = "2024-03-01", 
+               to = "2024-08-01")  
+
+returns <- spx %>% 
+  tq_transmute(select = adjusted, 
+               mutate_fun = periodReturn, 
+               period = "daily", 
+               col_rename = "daily_return") %>%
+  mutate(log_return = log1p(daily_return)) %>%
+  mutate(
+    roll_sd = slide_dbl(log_return, sd, .before = 21, .complete = TRUE),
+    mth_vol = roll_sd * sqrt(252)
+  ) %>%
+  as_tibble()
+```
+
+***
+#### Function to filter the previous 21 trading days
+```{r}
+hist_vol <- function(obs_date, lookback = 21) {
+  obs_date <- as.Date(obs_date)
+  
+  returns %>%
+    filter(date <= obs_date) %>%
+    slice_tail(n = lookback) %>%
+    mutate(
+      x_day = as.numeric(date - obs_date),
+      x = x_day / 252
+    )
+}
+```
+
+***
+#### Function to fit linear, quadratic and exponential models to data
+```{r}
+fit_vol <- function(vol_dat) {
+  const <- vol_dat$mth_vol[nrow(vol_dat)]
+  
+  lin <- lm(mth_vol ~ x, data = vol_dat)
+  
+  quad <- lm(mth_vol ~ x + I(x^2), data = vol_dat)
+  
+  # Use log-linear model to get good starting values
+  log_fit <- lm(log(mth_vol) ~ x, data = vol_dat)
+  start_a <- exp(coef(log_fit)[1])
+  start_b <- coef(log_fit)[2]
+  exp <- nlsLM(
+    mth_vol ~ a * exp(b * x),
+    data = vol_dat,
+    start = list(a = start_a, b = start_b)
+  )
+  
+  # Return data AND models together in a list
+  list(
+    vol_dat = vol_dat,
+    const = const,
+    lin = lin,
+    quad = quad,
+    exp = exp
+  )
+}
+```
+
+***
+#### Functions for integrated variance of each model
+```{r}
+V_lin <- function(t, fit) {
+  # sigma(t) = a*t + b
+  a <- coef(fit)[2]   # slope
+  b <- coef(fit)[1]   # intercept
+  
+  res <- (1/3) * a^2 * t^3 + (a * b) * t^2 + b^2 * t
+}
+
+V_quad <- function(t, fit) {
+  # sigma(t) = a*t^2 + b*t + c
+  a <- coef(fit)[3]
+  b <- coef(fit)[2]
+  c <- coef(fit)[1]
+  
+  (1/5) * a^2 * t^5 +
+    (1/2) * a * b * t^4 +
+    ((2/3) * a * c + (1/3) * b^2) * t^3 +
+    (b * c) * t^2 +
+    c^2 * t
+}
+
+V_exp <- function(t, fit) {
+  # sigma(t) = a*exp(b*t)
+  a <- coef(fit)[1]
+  b <- coef(fit)[2]
+  
+  ifelse(
+    abs(b) < 1e-8,
+    a^2 * t,
+    (a^2 / (2 * b)) * (exp(2 * b * t) - 1)
+  )
+}
+```
+
+***
+#### Functions for Black-Scholes model with constant and deterministic volatility
+```{r}
+bs_const_vol <- function(S, K, r, t, vol) {
+  d1 <- (log(S / K) + (r + 0.5 * vol^2) * t) / (vol * sqrt(t))
+  d2 <- d1 - vol * sqrt(t)
+  
+  S * pnorm(d1) - K * exp(-r * t) * pnorm(d2)
+}
+
+bs_det_vol <- function(S, K, r, t, V) {
+  V <- pmax(V, 1e-10)
+  d1 <- (log(S / K) + r * t + 0.5 * V) / sqrt(V)
+  d2 <- d1 - sqrt(V)
+  
+  S * pnorm(d1) - K * exp(-r * t) * pnorm(d2)
+}
+```
+
+***
+#### Function to create a results table for call prices on each date
+```{r}
+call_tbl_fun <- function(obs_date, vol_dat) {
+  call_dat <- calls %>%
+    filter(quote_date == obs_date) %>%
+    mutate(
+      x_day = as.numeric(as.Date(expiration_date) - as.Date(obs_date)),
+      x     = x_day / 252,
+    ) %>%
+    relocate(x_day, .after = expiration_date) %>%
+    relocate(x, .after = x_day)
+  
+  calls_tbl <- tibble(
+    x_day       = call_dat$x_day,
+    x           = call_dat$x,
+    "Obs. Date" = call_dat$quote_date,
+    "Exp. Date" = call_dat$expiration_date,
+    "S"         = call_dat$spot_price,
+    "K"         = call_dat$strike_price,
+    "t"         = call_dat$maturity_yrs,
+    "r"         = call_dat$interest_rate / 100,
+    "True Call" = call_dat$close,
+    
+    "Const Call" = bs_const_vol(S, K, r, t, vol_dat$const),
+    "Lin Call"   = bs_det_vol(S, K, r, t, V_lin(t, vol_dat$lin)),
+    "Quad Call"  = bs_det_vol(S, K, r, t, V_quad(t, vol_dat$quad)),
+    "Exp Call"   = bs_det_vol(S, K, r, t, V_exp(t, vol_dat$exp)),
+    
+    # Errors
+    err_const = `True Call` - `Const Call`,
+    err_lin   = `True Call` - `Lin Call`,
+    err_quad  = `True Call` - `Quad Call`,
+    err_exp   = `True Call` - `Exp Call`,
+    
+    abs_err_const = abs(err_const),
+    abs_err_lin   = abs(err_lin),
+    abs_err_quad  = abs(err_quad),
+    abs_err_exp   = abs(err_exp)
+  )
+  
+  return(calls_tbl)
+}
+```
+
+
+
+***
+#### Function to create a plot for 21-day rolling volatilities up to a given date
+```{r}
+plot_vol <- function(obs_date) {
+  # Build volatility table
+  fit <- hist_vol(obs_date) %>% fit_vol()
+  vol_dat <- fit$vol_dat
+  
+  # Build x-axis breaks
+  x_min    <- min(vol_dat$x_day)
+  x_max    <- max(vol_dat$x_day)
+  x_breaks <- seq(x_min, x_max, length.out = 5)
+  x_labels <- format(as.Date(obs_date) + round(x_breaks), "%b %d")
+  
+  # Get ending date for title
+  end_date <- max(as.Date(vol_dat$date))
+
+  ggplot(vol_dat, aes(x = x_day, y = mth_vol)) +
+    geom_point(size = 1.5) +
+    geom_line(aes(y = fit$const, color = "Constant"), linewidth = 0.8) +
+    geom_line(aes(y = predict(fit$lin), color = "Linear"), linewidth = 0.8) +
+    geom_line(aes(y = predict(fit$quad), color = "Quadratic"), linewidth = 0.8) +
+    geom_line(aes(y = predict(fit$exp), color = "Exponential"), linewidth = 0.8) +
+    scale_x_continuous(
+      breaks = x_breaks,
+      labels = x_labels
+    ) +
+    labs(
+#      title = paste(
+#        "SPX 21-Trading-Day Rolling Volatility from",
+#        format(as.Date(obs_date), "%B %d"),
+#        "to",
+#        format(end_date, "%B %d, %Y")
+#      ),
+      x = "Date",
+      y = "Monthly Volatility",
+      color = "Model"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+
+
+***
+#### Output model performance for volatility fits on all dates
+```{r}
+vol_errs_tbl <- function(obs_date) {
+  fit     <- hist_vol(obs_date) %>% fit_vol()
+  vol_dat <- fit$vol_dat
+
+  vol_dat %>%
+    transmute(
+      `Obs. Date` = as.Date(obs_date),
+      date,
+      mth_vol,
+      fitted_const = fit$const,
+      fitted_lin   = predict(fit$lin),
+      fitted_quad  = predict(fit$quad),
+      fitted_exp   = predict(fit$exp),
+
+      err_const = mth_vol - fitted_const,
+      err_lin   = mth_vol - fitted_lin,
+      err_quad  = mth_vol - fitted_quad,
+      err_exp   = mth_vol - fitted_exp,
+
+      abs_err_const = abs(err_const),
+      abs_err_lin   = abs(err_lin),
+      abs_err_quad  = abs(err_quad),
+      abs_err_exp   = abs(err_exp)
+    ) %>%
+    select(-c(3:7))
+}
+
+vol_errs_tbl("2024-05-27")
+vol_errs_tbl("2024-06-03")
+vol_errs_tbl("2024-06-10")
+vol_errs_tbl("2024-06-17")
+vol_errs_tbl("2024-06-24")
+vol_errs_tbl("2024-07-01")
+vol_errs_tbl("2024-07-08")
+vol_errs_tbl("2024-07-15")
+vol_errs_tbl("2024-07-22")
+vol_errs_tbl("2024-07-29")
+```
+
+***
+#### Summarize volatility model performance across all dates
+```{r}
+obs_dates <- c(
+  "2024-05-27", "2024-06-03", "2024-06-10", "2024-06-17",
+  "2024-06-24", "2024-07-01", "2024-07-08", "2024-07-15",
+  "2024-07-22", "2024-07-29"
+)
+
+vol_summary_tbl <- map_dfr(obs_dates, function(d) {
+  vol_errs_tbl(d) %>%
+    summarise(
+      Date       = d,
+      RMSE_const = sqrt(mean(err_const^2, na.rm = TRUE)),
+      RMSE_lin   = sqrt(mean(err_lin^2,   na.rm = TRUE)),
+      RMSE_quad  = sqrt(mean(err_quad^2,  na.rm = TRUE)),
+      RMSE_exp   = sqrt(mean(err_exp^2,   na.rm = TRUE)),
+      MAE_const  = mean(abs_err_const, na.rm = TRUE),
+      MAE_lin    = mean(abs_err_lin,   na.rm = TRUE),
+      MAE_quad   = mean(abs_err_quad,  na.rm = TRUE),
+      MAE_exp    = mean(abs_err_exp,   na.rm = TRUE)
+    )
+}) %>%
+  bind_rows(
+    summarise(.,
+      Date       = "Mean",
+      RMSE_const = round(mean(RMSE_const), 4),
+      RMSE_lin   = mean(RMSE_lin),
+      RMSE_quad  = mean(RMSE_quad),
+      RMSE_exp   = mean(RMSE_exp),
+      MAE_const  = mean(MAE_const),
+      MAE_lin    = mean(MAE_lin),
+      MAE_quad   = mean(MAE_quad),
+      MAE_exp    = mean(MAE_exp)
+    )
+  )
+
+vol_summary_tbl
+```
+
+***
+#### Best-fit model per date for volatility
+```{r}
+vol_best_fit_tbl <- vol_summary_tbl %>%
+  rowwise() %>%
+  mutate(
+    RMSE_Best_Fit = c("Constant", "Linear", "Quadratic", "Exponential")[
+      which.min(c(RMSE_const, RMSE_lin, RMSE_quad, RMSE_exp))
+    ],
+    RMSE = min(RMSE_const, RMSE_lin, RMSE_quad, RMSE_exp) %>% round(4),
+
+    MAE_Best_Fit = c("Constant", "Linear", "Quadratic", "Exponential")[
+      which.min(c(MAE_const, MAE_lin, MAE_quad, MAE_exp))
+    ],
+    MAE = min(MAE_const, MAE_lin, MAE_quad, MAE_exp) %>% round(4)
+  ) %>%
+  ungroup() %>%
+  select(Date, RMSE_Best_Fit, RMSE, MAE_Best_Fit, MAE)
+
+vol_best_fit_tbl
+```
+
+
+
+***
+#### Function to create a plot for call prices on a given date
+```{r}
+plot_call_prices <- function(obs_date) {
+  # Build volatility + call price tables
+  vol_dat   <- hist_vol(obs_date) %>% fit_vol()
+  calls_dat <- call_tbl_fun(obs_date, vol_dat)
+
+  # Build x-axis breaks
+  x_min    <- min(calls_dat$x_day)
+  x_max    <- max(calls_dat$x_day)
+  x_breaks <- seq(x_min, x_max, length.out = 5)
+  x_labels <- format(as.Date(obs_date) + round(x_breaks), "%b %d")
+
+  # Get ending date for title
+  end_date <- max(as.Date(calls_dat$`Exp. Date`))
+
+  ggplot(calls_dat, aes(x = x_day, y = `True Call`)) +
+    geom_point(size = 1.5) +
+    geom_line(aes(y = `Const Call`, color = "Constant"), linewidth = 0.8) +
+    geom_line(aes(y = `Lin Call`, color = "Linear"), linewidth = 0.8) +
+    geom_line(aes(y = `Quad Call`, color = "Quadratic"), linewidth = 0.8) +
+    geom_line(aes(y = `Exp Call`, color = "Exponential"), linewidth = 0.8) +
+    scale_x_continuous(
+      breaks = x_breaks,
+      labels = x_labels
+    ) +
+    labs(
+#      title = paste(
+#        "Call Prices from",
+#        format(as.Date(obs_date), "%B %d"),
+#        "to",
+#        format(end_date, "%B %d, %Y")
+#      ),
+      x = "Date",
+      y = "Call Price ($)",
+      color = "Model"
+    ) +
+    theme(plot.title = element_text(hjust = 0.5))
+}
+```
+
+***
+#### Plot all volatilities and call prices
+```{r}
+plot_vol("2024-05-27")
+plot_call_prices("2024-05-27")
+
+plot_vol("2024-06-03")
+plot_call_prices("2024-06-03")
+
+plot_vol("2024-06-10")
+plot_call_prices("2024-06-10")
+
+plot_vol("2024-06-17")
+plot_call_prices("2024-06-17")
+
+plot_vol("2024-06-24")
+plot_call_prices("2024-06-24")
+
+plot_vol("2024-07-01")
+plot_call_prices("2024-07-01")
+
+plot_vol("2024-07-08")
+plot_call_prices("2024-07-08")
+
+plot_vol("2024-07-15")
+plot_call_prices("2024-07-15")
+
+plot_vol("2024-07-22")
+plot_call_prices("2024-07-22")
+
+plot_vol("2024-07-29")
+plot_call_prices("2024-07-29")
+```
+
+***
+#### Output model performance for call prices on all dates
+```{r}
+errs_tbl <- function(obs_date){
+  vol_dat   <- hist_vol(obs_date) %>% fit_vol()
+  calls_dat <- call_tbl_fun(obs_date, vol_dat) %>%
+    select(-c(1:2), -c(5:13))
+  return(calls_dat)
+}
+
+errs_tbl("2024-05-27")
+errs_tbl("2024-06-03")
+errs_tbl("2024-06-10")
+errs_tbl("2024-06-17")
+errs_tbl("2024-06-24")
+errs_tbl("2024-07-01")
+errs_tbl("2024-07-08")
+errs_tbl("2024-07-15")
+errs_tbl("2024-07-22")
+errs_tbl("2024-07-29")
+```
+
+***
+#### Summarize model performance for call prices on all dates
+```{r}
+summary_tbl <- map_dfr(obs_dates, function(d) {
+  errs_tbl(d) %>%
+    summarise(
+      Date      = d,
+      RMSE_const = sqrt(mean(err_const^2, na.rm = TRUE)),
+      RMSE_lin   = sqrt(mean(err_lin^2,   na.rm = TRUE)),
+      RMSE_quad  = sqrt(mean(err_quad^2,  na.rm = TRUE)),
+      RMSE_exp   = sqrt(mean(err_exp^2,   na.rm = TRUE)),
+      MAE_const  = mean(abs_err_const, na.rm = TRUE),
+      MAE_lin    = mean(abs_err_lin,   na.rm = TRUE),
+      MAE_quad   = mean(abs_err_quad,  na.rm = TRUE),
+      MAE_exp    = mean(abs_err_exp,   na.rm = TRUE)
+    )
+}) %>%
+  bind_rows(
+    summarise(.,
+      Date       = "Mean",
+      RMSE_const = mean(RMSE_const),
+      RMSE_lin   = mean(RMSE_lin),
+      RMSE_quad  = mean(RMSE_quad),
+      RMSE_exp   = mean(RMSE_exp),
+      MAE_const  = mean(MAE_const),
+      MAE_lin    = mean(MAE_lin),
+      MAE_quad   = mean(MAE_quad),
+      MAE_exp    = mean(MAE_exp)
+    )
+  )
+
+summary_tbl
+```
+
+***
+#### Best-fit model per date for call prices
+```{r}
+best_fit_tbl <- summary_tbl %>%
+  rowwise() %>%
+  mutate(
+    RMSE_Best_Fit = c("Constant", "Linear", "Quadratic", "Exponential")[
+      which.min(c(RMSE_const, RMSE_lin, RMSE_quad, RMSE_exp))
+    ],
+    RMSE = min(RMSE_const, RMSE_lin, RMSE_quad, RMSE_exp) %>% round(2),
+    
+    MAE_Best_Fit = c("Constant", "Linear", "Quadratic", "Exponential")[
+      which.min(c(MAE_const, MAE_lin, MAE_quad, MAE_exp))
+    ],
+    MAE = min(MAE_const, MAE_lin, MAE_quad, MAE_exp) %>% round(2)
+  ) %>%
+  ungroup() %>%
+  select(Date, RMSE_Best_Fit, RMSE, MAE_Best_Fit, MAE)
+
+best_fit_tbl
+```
+
+***
+#### Paired t-tests: volatility model errors vs. constant baseline
+```{r}
+# Filter out the "Mean" summary row — keep only the 10 date rows
+vol_test_dat <- vol_summary_tbl %>% filter(Date != "Mean")
+
+# RMSE tests (volatility)
+vol_rmse_lin  <- t.test(vol_test_dat$RMSE_lin,  vol_test_dat$RMSE_const, paired = TRUE)
+vol_rmse_quad <- t.test(vol_test_dat$RMSE_quad, vol_test_dat$RMSE_const, paired = TRUE)
+vol_rmse_exp  <- t.test(vol_test_dat$RMSE_exp,  vol_test_dat$RMSE_const, paired = TRUE)
+
+# MAE tests (volatility)
+vol_mae_lin   <- t.test(vol_test_dat$MAE_lin,   vol_test_dat$MAE_const,  paired = TRUE)
+vol_mae_quad  <- t.test(vol_test_dat$MAE_quad,  vol_test_dat$MAE_const,  paired = TRUE)
+vol_mae_exp   <- t.test(vol_test_dat$MAE_exp,   vol_test_dat$MAE_const,  paired = TRUE)
+
+# Compile results into a readable table
+vol_ttest_results <- tibble(
+  Model    = rep(c("Linear", "Quadratic", "Exponential"), 2),
+  Metric   = rep(c("RMSE", "MAE"), each = 3),
+  Mean_Diff = c(
+    vol_rmse_lin$estimate,  vol_rmse_quad$estimate,  vol_rmse_exp$estimate,
+    vol_mae_lin$estimate,   vol_mae_quad$estimate,   vol_mae_exp$estimate
+  ),
+  t_stat   = c(
+    vol_rmse_lin$statistic,  vol_rmse_quad$statistic,  vol_rmse_exp$statistic,
+    vol_mae_lin$statistic,   vol_mae_quad$statistic,   vol_mae_exp$statistic
+  ),
+  p_value  = c(
+    vol_rmse_lin$p.value,  vol_rmse_quad$p.value,  vol_rmse_exp$p.value,
+    vol_mae_lin$p.value,   vol_mae_quad$p.value,   vol_mae_exp$p.value
+  ),
+  CI_lower = c(
+    vol_rmse_lin$conf.int[1],  vol_rmse_quad$conf.int[1],  vol_rmse_exp$conf.int[1],
+    vol_mae_lin$conf.int[1],   vol_mae_quad$conf.int[1],   vol_mae_exp$conf.int[1]
+  ),
+  CI_upper = c(
+    vol_rmse_lin$conf.int[2],  vol_rmse_quad$conf.int[2],  vol_rmse_exp$conf.int[2],
+    vol_mae_lin$conf.int[2],   vol_mae_quad$conf.int[2],   vol_mae_exp$conf.int[2]
+  )
+) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+vol_ttest_results
+```
+
+#### Paired t-tests: call pricing model errors vs. constant baseline
+```{r}
+call_test_dat <- summary_tbl %>% filter(Date != "Mean")
+
+# RMSE tests (call pricing)
+call_rmse_lin  <- t.test(call_test_dat$RMSE_lin,  call_test_dat$RMSE_const, paired = TRUE)
+call_rmse_quad <- t.test(call_test_dat$RMSE_quad, call_test_dat$RMSE_const, paired = TRUE)
+call_rmse_exp  <- t.test(call_test_dat$RMSE_exp,  call_test_dat$RMSE_const, paired = TRUE)
+
+# MAE tests (call pricing)
+call_mae_lin   <- t.test(call_test_dat$MAE_lin,   call_test_dat$MAE_const,  paired = TRUE)
+call_mae_quad  <- t.test(call_test_dat$MAE_quad,  call_test_dat$MAE_const,  paired = TRUE)
+call_mae_exp   <- t.test(call_test_dat$MAE_exp,   call_test_dat$MAE_const,  paired = TRUE)
+
+call_ttest_results <- tibble(
+  Model    = rep(c("Linear", "Quadratic", "Exponential"), 2),
+  Metric   = rep(c("RMSE", "MAE"), each = 3),
+  Mean_Diff = c(
+    call_rmse_lin$estimate,  call_rmse_quad$estimate,  call_rmse_exp$estimate,
+    call_mae_lin$estimate,   call_mae_quad$estimate,   call_mae_exp$estimate
+  ),
+  t_stat   = c(
+    call_rmse_lin$statistic,  call_rmse_quad$statistic,  call_rmse_exp$statistic,
+    call_mae_lin$statistic,   call_mae_quad$statistic,   call_mae_exp$statistic
+  ),
+  p_value  = c(
+    call_rmse_lin$p.value,  call_rmse_quad$p.value,  call_rmse_exp$p.value,
+    call_mae_lin$p.value,   call_mae_quad$p.value,   call_mae_exp$p.value
+  ),
+  CI_lower = c(
+    call_rmse_lin$conf.int[1],  call_rmse_quad$conf.int[1],  call_rmse_exp$conf.int[1],
+    call_mae_lin$conf.int[1],   call_mae_quad$conf.int[1],   call_mae_exp$conf.int[1]
+  ),
+  CI_upper = c(
+    call_rmse_lin$conf.int[2],  call_rmse_quad$conf.int[2],  call_rmse_exp$conf.int[2],
+    call_mae_lin$conf.int[2],   call_mae_quad$conf.int[2],   call_mae_exp$conf.int[2]
+  )
+) %>%
+  mutate(across(where(is.numeric), \(x) round(x, 4)))
+
+call_ttest_results
+write.csv(call_ttest_results, "Call_T-Test.csv")
+```
+

@@ -1,0 +1,191 @@
+---
+title: "WV_Thesis_Summary"
+author: "Wes Vorley"
+date: "2026-04-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(tidyquant)
+library(minpack.lm)
+library(slider)
+```
+
+***
+#### Read call data, remove N/A values and separate by date call was listed
+```{r}
+calls <- read.csv("SPX_ATM_calls_MayJul2024.csv") %>%
+  na.omit() %>%
+  mutate(
+    quote_date = as.Date(date), .before = expiration_date,
+    expiration_date = as.Date(expiration_date)
+  ) %>%
+  select(-date)
+```
+
+***
+#### Obtain daily log returns of SPX from May 2023 to August 2025, add column for 21-trading-day rolling volatility, and annualized using `sqrt(252)`.
+```{r}
+spx <- tq_get("^GSPC", get = "stock.prices",
+               from = "2024-03-01", 
+               to = "2024-08-01")  
+
+returns <- spx %>% 
+  tq_transmute(select = adjusted, 
+               mutate_fun = periodReturn, 
+               period = "daily", 
+               col_rename = "daily_return") %>%
+  mutate(log_return = log1p(daily_return)) %>%
+  mutate(
+    roll_sd = slide_dbl(log_return, sd, .before = 21, .complete = TRUE),
+    mth_vol = roll_sd * sqrt(252)
+  ) %>%
+  as_tibble()
+```
+
+***
+#### Filter volatilities or calls within a given range
+```{r}
+tot_vol <- function(start_date, end_date) {
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  
+  res <- returns %>%
+    filter(date >= start_date & date <= end_date) %>%
+    mutate(
+      x_day = as.numeric(date - start_date)
+    )
+  return(res)
+}
+
+tot_call <- function(start_date, end_date) {
+  start_date <- as.Date(start_date)
+  end_date <- as.Date(end_date)
+  
+  res <- calls %>%
+    filter(expiration_date >= start_date & expiration_date <= end_date) %>%
+    mutate(
+      x_day = as.numeric(expiration_date - start_date)
+    )
+  return(res)
+}
+```
+
+***
+#### Plot all volatilities
+```{r}
+tot_vols <- tot_vol("2024-04-27", "2024-07-29")
+
+# Build x-axis breaks
+  x_min    <- min(tot_vols$x_day)
+  x_max    <- max(tot_vols$x_day)
+  x_breaks <- seq(x_min, x_max, length.out = 5)
+  x_labels <- format(as.Date(tot_vols$date[1]) + round(x_breaks), "%b %d")
+
+# Build the plot
+ggplot(tot_vols, aes(x = x_day, y = mth_vol)) +
+  geom_point() +
+  scale_x_continuous(
+    breaks = x_breaks,
+    labels = x_labels
+  ) +
+  labs(
+    x = "Date",
+    y = "Monthly Volatility"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+***
+#### Summary stats for all volatilities
+```{r}
+tot_vols_tbl <- tibble(
+  Obs = nrow(tot_vols),
+  Min = min(tot_vols$mth_vol),
+  Max = max(tot_vols$mth_vol),
+  Mean = mean(tot_vols$mth_vol),
+  Median = median(tot_vols$mth_vol),
+  "Std Dev" = sd(tot_vols$mth_vol)
+) %>% signif(4)
+
+tot_vols_tbl
+```
+
+***
+#### Plot all call prices
+```{r}
+tot_calls <- tot_call("2024-05-27", "2024-08-29")
+
+# Build x-axis breaks
+  x_min    <- min(tot_calls$x_day)
+  x_max    <- max(tot_calls$x_day)
+  x_breaks <- seq(x_min, x_max, length.out = 5)
+  x_labels <- format(as.Date(tot_calls$expiration_date[1]) + round(x_breaks), "%b %d")
+
+# Build the plot
+ggplot(tot_calls, aes(x = x_day, y = close)) +
+  geom_point(size = 0.8) +
+  scale_x_continuous(
+    breaks = x_breaks,
+    labels = x_labels
+  ) +
+  labs(
+    x = "Expiration Date",
+    y = "Call Price"
+  ) +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+***
+#### Summary stats for all call prices
+```{r}
+tot_calls_tbl <- tibble(
+  Obs = nrow(tot_calls),
+  Min = min(tot_calls$close),
+  Max = max(tot_calls$close),
+  Mean = mean(tot_calls$close),
+  Median = median(tot_calls$close),
+  "Std Dev" = sd(tot_calls$close)
+) %>% signif(4)
+
+tot_calls_tbl
+```
+
+#### Compute and plot vega across all call observations
+```{r}
+# 1. Build a lookup of spot volatility by date from the returns series
+vol_lookup <- returns %>%
+  select(date, mth_vol) %>%
+  filter(!is.na(mth_vol))
+
+# 2. Join spot vol onto each call by its quote_date, then compute vega
+vega_dat <- tot_calls %>%
+  left_join(vol_lookup, by = c("quote_date" = "date")) %>%
+  filter(!is.na(mth_vol)) %>%
+  mutate(
+    t   = maturity_yrs,
+    vol = mth_vol,
+    r   = interest_rate / 100,
+    d1  = (log(spot_price / strike_price) + (r + 0.5 * vol^2) * t) / (vol * sqrt(t)),
+    vega = spot_price * dnorm(d1) * sqrt(t)
+  )
+
+# Plot vega vs. time to expiration, coloured by quote date
+vega_dat %>%
+  filter(is.finite(vega), t > 0) %>%
+  ggplot(aes(x = t * 252, y = vega, color = as.factor(quote_date))) +
+  geom_point(size = 0.9, alpha = 0.7) +
+  labs(
+    x     = "Days Until Expiration",
+    y     = "Vega (∂C/∂σ)",
+    color = "Quote Date"
+  ) +
+  theme(
+    plot.title   = element_text(hjust = 0.5),
+    legend.title = element_text(size = 9),
+    legend.text  = element_text(size = 7)
+  )
+```
