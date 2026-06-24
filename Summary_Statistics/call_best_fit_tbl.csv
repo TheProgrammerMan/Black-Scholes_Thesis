@@ -1,0 +1,12 @@
+"","Date","RMSE_Best_Fit","RMSE","MAE_Best_Fit","MAE"
+"1","2024-05-27","Constant",12.99,"Constant",12.12
+"2","2024-06-03","Exponential",11.25,"Exponential",9.31
+"3","2024-06-10","Exponential",9.83,"Exponential",8.44
+"4","2024-06-17","Constant",16.62,"Constant",15.34
+"5","2024-06-24","Quadratic",11.88,"Quadratic",9.23
+"6","2024-07-01","Exponential",4.2,"Exponential",3.62
+"7","2024-07-08","Quadratic",6.48,"Quadratic",5.67
+"8","2024-07-15","Constant",127.07,"Constant",126.51
+"9","2024-07-22","Quadratic",77.98,"Quadratic",74.9
+"10","2024-07-29","Quadratic",19.4,"Quadratic",17.12
+"11","Mean","Quadratic",35.41,"Quadratic",33.87
