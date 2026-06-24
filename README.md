@@ -1,2 +1,5 @@
 # Black-Scholes_Thesis
 A Thesis examining the effects of time-varying deterministic volatility on the Black Scholes Model
+
+# Abstract
+This paper looks at an extension of the Black Scholes model for call option prices, specifically examining how changes in pricing accuracy respond to a deterministic, time-varying volatility specification. The thesis analyzes volatilities of the S&P 500 index (SPX) from April 27 to July 29 of 2024 and models monthly trends through linear, quadratic, and exponential regression. It then uses integrated variance and the Black-Scholes model to calculate theoretical call prices based on future volatilities predicted from each model and compares them with true SPX call prices from May 27 to August 29 of 2024. The findings suggest that quadratic and exponential models best fit historical volatility over month-long timeframes, but no specification showed superior accuracy over the constant-volatility assumption with regard to true call prices.
